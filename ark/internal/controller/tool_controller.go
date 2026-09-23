@@ -12,12 +12,16 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	arkv1alpha1 "mckinsey.com/ark/api/v1alpha1"
 	"mckinsey.com/ark/internal/eventing"
@@ -37,9 +41,8 @@ const (
 	inlineAvailableMessage = "Inline tool is callable; its runner starts on the first call"
 )
 
-// inlineActivatorRetry is how long to wait before re-checking an activator that
-// is missing or has no available replica. There is no watch for it: a periodic
-// re-check only runs while the Tool is unusable.
+// inlineActivatorRetry bounds status refreshes for the activator and recovers
+// missed policy/label events. These checks only read API objects, never traffic.
 const inlineActivatorRetry = 30 * time.Second
 
 type ToolReconciler struct {
@@ -55,6 +58,8 @@ type ToolReconciler struct {
 // Service, NetworkPolicy and Deployment per inline Tool.
 // +kubebuilder:rbac:groups="",resources=configmaps;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ToolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -110,13 +115,14 @@ func (r *ToolReconciler) reconcileInline(ctx context.Context, tool *arkv1alpha1.
 		retry, err := r.drainInlineRunner(ctx, tool)
 		return ctrl.Result{RequeueAfter: retry}, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: inlineActivatorRetry}, nil
 }
 
 // setInlineStatus writes the verdict. The address is only ever stored together
 // with Available=True for the generation just evaluated, so a reader that
 // checks the condition can never act on an address from an older spec.
 func (r *ToolReconciler) setInlineStatus(ctx context.Context, tool *arkv1alpha1.Tool, verdict inlineVerdict) error {
+	previous := tool.DeepCopy().Status
 	status := metav1.ConditionFalse
 	tool.Status.State = arkv1alpha1.ToolStatePending
 	tool.Status.ResolvedAddress = ""
@@ -133,6 +139,9 @@ func (r *ToolReconciler) setInlineStatus(ctx context.Context, tool *arkv1alpha1.
 		Message:            verdict.message,
 		ObservedGeneration: tool.Generation,
 	})
+	if equality.Semantic.DeepEqual(previous, tool.Status) {
+		return nil
+	}
 
 	if err := r.Status().Update(ctx, tool); err != nil {
 		return fmt.Errorf("failed to update tool status: %v", err)
@@ -188,7 +197,12 @@ func (r *ToolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&networkingv1.NetworkPolicy{}).
+		Watches(&networkingv1.NetworkPolicy{}, handler.EnqueueRequestsFromMapFunc(r.inlineToolsInNamespace),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.inlineToolsInNamespace),
+			builder.WithPredicates(inlineNetworkLabelsChanged())).
+		Watches(&appsv1.ReplicaSet{}, handler.EnqueueRequestsFromMapFunc(r.inlineToolsInNamespace),
+			builder.WithPredicates(inlineNetworkLabelsChanged())).
 		Named("tool").
 		Complete(r)
 }
